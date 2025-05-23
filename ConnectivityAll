@@ -1,0 +1,74 @@
+import glob, os, re
+import nibabel as nib
+import pandas as pd
+from nilearn.connectome import ConnectivityMeasure
+from nilearn import datasets, image
+from nilearn.input_data import NiftiMapsMasker
+
+# ————————————————
+# 0. Parameters & paths
+# ————————————————
+base_dir     = '/Users/lyanne/EmpathicPain/Data'
+n_trim_start = 3
+n_trim_end   = 3
+
+# Prepare the atlas+masker once
+ho_cort = datasets.fetch_atlas_harvard_oxford('cort-prob-2mm')
+ho_sub  = datasets.fetch_atlas_harvard_oxford('sub-prob-2mm')
+atlas4d = image.concat_imgs([ho_cort.maps, ho_sub.maps])
+labels  = ho_cort.labels[1:] + ho_sub.labels[1:]
+
+masker  = NiftiMapsMasker(
+    maps_img   = atlas4d,
+    labels     = labels,
+    standardize= True,
+    t_r        = 2.5,
+    verbose    = 1
+)
+corr_measure = ConnectivityMeasure(kind='correlation')
+
+# ————————————————
+# 1. Loop over subjects
+# ————————————————
+subject_dirs = sorted(glob.glob(os.path.join(base_dir, 'sub-*')))
+for subj_dir in subject_dirs:
+    subj_id  = os.path.basename(subj_dir)
+    func_dir = os.path.join(subj_dir, 'func')
+    reg_dir  = os.path.join(base_dir, 'events', subj_id, 'regressors')
+    print(f"\n▶ Subject {subj_id}")
+
+    # 2. Loop over runs
+    bold_files = sorted(glob.glob(os.path.join(
+        func_dir, '*MNI152NLin2009cAsym*_bold.nii*'
+    )))
+    for bold_path in bold_files:
+        basename = os.path.basename(bold_path)
+        m = re.match(r'(sub-[^_]+_task-[^_]+).*?(run-\d+)', basename)
+        if not m:
+            continue
+        subj_task, run = m.group(1), m.group(2)
+
+        # 3. Load & trim image
+        img = nib.load(bold_path)
+        data = img.get_fdata()
+        trimmed = data[..., n_trim_start : data.shape[3] - n_trim_end]
+        img_trimmed = nib.Nifti1Image(trimmed, img.affine, img.header)
+
+        # 4. Load confounds
+        conf_file = os.path.join(reg_dir, f"{subj_task}_{run}_confounds.txt")
+        conf_df = pd.read_csv(conf_file, sep='\t', header=None)
+
+        # 5. Extract ROI time series
+        ts = masker.fit_transform(img_trimmed, conf_df)
+
+        # 6. Compute connectivity
+        conn_mat = corr_measure.fit_transform([ts])[0]
+        print(f"  {run} → conn matrix shape {conn_mat.shape}")
+
+        # 7. Save
+        out_fname = f"{subj_id}_{run}_connectivity.csv"
+        pd.DataFrame(conn_mat).to_csv(out_fname, index=False)
+        print(f"    saved to {out_fname}")
+
+
+
